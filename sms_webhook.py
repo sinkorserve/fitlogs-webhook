@@ -28,8 +28,10 @@ import os, re, json, uuid
 import firebase_admin
 from firebase_admin import credentials, firestore
 import anthropic
+from flask_cors import CORS
 
 app = Flask(__name__)
+CORS(app, origins=["https://fitlogs.ai","https://www.fitlogs.ai","https://fitlogs-app.vercel.app"])
 
 # ── Config ────────────────────────────────────────────────────────
 TWILIO_AUTH_TOKEN  = os.environ.get("TWILIO_AUTH_TOKEN", "")
@@ -675,7 +677,53 @@ def confirm_log():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route("/health", methods=["GET"])
+@app.route("/verify/send", methods=["POST"])
+def verify_send():
+    """Send OTP via Twilio Verify for signup phone verification."""
+    try:
+        data  = request.get_json()
+        phone = data.get("phone","").strip()
+        if not phone:
+            return jsonify({"error":"Phone number required"}), 400
+
+        verify_sid = os.environ.get("TWILIO_VERIFY_SERVICE_SID","")
+        if not verify_sid:
+            return jsonify({"error":"Verify service not configured"}), 500
+
+        from twilio.rest import Client as TwilioClient
+        client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        verification = client.verify.v2.services(verify_sid)\
+            .verifications.create(to=phone, channel="sms")
+        return jsonify({"success": True, "status": verification.status})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/verify/check", methods=["POST"])
+def verify_check():
+    """Check OTP code via Twilio Verify."""
+    try:
+        data  = request.get_json()
+        phone = data.get("phone","").strip()
+        code  = data.get("code","").strip()
+        if not phone or not code:
+            return jsonify({"error":"Phone and code required"}), 400
+
+        verify_sid = os.environ.get("TWILIO_VERIFY_SERVICE_SID","")
+        if not verify_sid:
+            return jsonify({"error":"Verify service not configured"}), 500
+
+        from twilio.rest import Client as TwilioClient
+        client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        check = client.verify.v2.services(verify_sid)\
+            .verification_checks.create(to=phone, code=code)
+        if check.status == "approved":
+            return jsonify({"success": True})
+        else:
+            return jsonify({"success": False, "status": check.status})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 def health():
     return jsonify({
         "status": "ok",
