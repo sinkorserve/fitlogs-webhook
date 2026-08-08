@@ -1,49 +1,93 @@
 """
-fitlogs.ai -- SMS Webhook Server (Text-Only v1)
-Twilio number: +18885965467
+fitlogs.ai -- Combined Webhook Server
+Handles:
+  1. Twilio inbound SMS -> parses fitness log, saves to Firestore, AI coach replies
+     - Recognizes: food/meals, steps/movement, sleep, water, weight, workout, mood
+     - COACH command: asks AI coach a question
+     - SUMMARY command: get today's summary
+     - HELP command: list commands
+  2. Stripe webhook -> upgrades user plan on payment
+  3. /insights endpoint -> Claude AI coach chat from dashboard
+  4. /verify endpoints -> Twilio OTP for signup
+  5. /account/update-phone -> migrate user data
+  6. Daily/weekly email summaries
 
-Tier routing:
-  - Unregistered user -> onboarding message, link to fitlogs.ai
-  - Track ($9.99)     -> logging only, AI parses and confirms
-  - Coach ($19.99)    -> logging + real-time empathetic AI coaching
-  - Trainer ($29.99)  -> same as Coach, trainer has read dashboard access
-
-TEXT ONLY. No MMS. No image handling. Zero binary data.
+Install: pip install flask twilio firebase-admin requests gunicorn stripe anthropic
 
 Environment variables:
     TWILIO_AUTH_TOKEN
     TWILIO_ACCOUNT_SID
     FIREBASE_CREDENTIALS_JSON
+    STRIPE_SECRET_KEY
+    STRIPE_WEBHOOK_SECRET
     ANTHROPIC_API_KEY
-    VALIDATE_TWILIO   ("false" in dev, "true" in prod)
-
-Install: pip install flask twilio firebase-admin anthropic gunicorn
+    TWILIO_VERIFY_SERVICE_SID
+    ZOHO_EMAIL
+    ZOHO_PASSWORD
+    CRON_SECRET
 """
 
 from flask import Flask, request, jsonify
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.request_validator import RequestValidator
-from datetime import datetime, timezone
+from twilio.rest import Client as TwilioClient
+from datetime import datetime, timezone, timedelta
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+import threading
 import os, re, json, uuid
+import requests as http
 import firebase_admin
 from firebase_admin import credentials, firestore
+import stripe
 import anthropic
-from flask_cors import CORS
 
 app = Flask(__name__)
-CORS(app, origins=["https://fitlogs.ai","https://www.fitlogs.ai","https://fitlogs-app.vercel.app"])
 
-# ── Config ────────────────────────────────────────────────────────
-TWILIO_AUTH_TOKEN  = os.environ.get("TWILIO_AUTH_TOKEN", "")
-TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
-ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
-VALIDATE_TWILIO    = os.environ.get("VALIDATE_TWILIO", "true").lower() == "true"
-FITLOGS_NUMBER     = "+18885965467"
-FITLOGS_URL        = "https://fitlogs.ai"
+# ── CORS ────────────────────────────────────────────────────────────────────
+@app.after_request
+def add_cors_headers(response):
+    origin = request.headers.get('Origin', '')
+    allowed = ['https://fitlogs.ai', 'https://www.fitlogs.ai',
+               'https://fitlogs-git-dev-sinkorserves-projects.vercel.app']
+    if origin in allowed or '.vercel.app' in origin or origin.endswith('fitlogs.ai'):
+        response.headers['Access-Control-Allow-Origin'] = origin
+        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+        response.headers['Access-Control-Max-Age'] = '86400'
+        if request.method == 'OPTIONS':
+            response.status_code = 200
+    return response
 
-claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+@app.route('/insights', methods=['OPTIONS'])
+def insights_options():
+    return '', 204
 
-# ── Firebase ──────────────────────────────────────────────────────
+@app.route('/coach', methods=['OPTIONS'])
+def coach_options():
+    return '', 204
+
+# ── Config ──────────────────────────────────────────────────────────────────
+TWILIO_AUTH_TOKEN     = os.environ.get("TWILIO_AUTH_TOKEN", "")
+TWILIO_ACCOUNT_SID    = os.environ.get("TWILIO_ACCOUNT_SID", "")
+VALIDATE_TWILIO       = os.environ.get("VALIDATE_TWILIO", "true").lower() == "true"
+STRIPE_SECRET_KEY     = os.environ.get("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+ANTHROPIC_API_KEY     = os.environ.get("ANTHROPIC_API_KEY", "")
+TWILIO_NUMBER         = "+18885965467"
+VERIFY_SERVICE_SID    = os.environ.get("TWILIO_VERIFY_SERVICE_SID", "")
+
+stripe.api_key  = STRIPE_SECRET_KEY
+claude_client   = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+ZOHO_EMAIL    = os.environ.get("ZOHO_EMAIL", "admin@fitlogs.ai")
+ZOHO_PASSWORD = os.environ.get("ZOHO_PASSWORD", "")
+SMTP_HOST     = "smtp.zoho.com"
+SMTP_PORT     = 465
+twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+# ── Firebase ────────────────────────────────────────────────────────────────
 if not firebase_admin._apps:
     creds_json = os.environ.get("FIREBASE_CREDENTIALS_JSON")
     if creds_json:
@@ -54,685 +98,632 @@ if not firebase_admin._apps:
 
 db = firestore.client()
 
-# ── System prompts ────────────────────────────────────────────────
+# ── Parse fitness log from SMS ───────────────────────────────────────────────
+FOOD_KEYWORDS    = ['ate', 'had', 'eaten', 'breakfast', 'lunch', 'dinner', 'snack',
+                    'drank', 'drink', 'coffee', 'tea', 'water', 'meal', 'food', 'cal', 'calories']
+STEPS_KEYWORDS   = ['steps', 'walked', 'walk', 'run', 'ran', 'jog', 'jogged', 'miles', 'km',
+                    'distance', 'cardio', 'bike', 'biked', 'swim', 'swam']
+SLEEP_KEYWORDS   = ['slept', 'sleep', 'hours sleep', 'hr sleep', 'hrs sleep', 'nap', 'woke', 'bed']
+WEIGHT_KEYWORDS  = ['weigh', 'weight', 'lbs', 'kg', 'pounds', 'scale']
+WORKOUT_KEYWORDS = ['workout', 'gym', 'lift', 'lifted', 'press', 'squat', 'deadlift',
+                    'bench', 'sets', 'reps', 'exercise', 'training', 'trained', 'hiit', 'yoga', 'pilates']
+WATER_KEYWORDS   = ['water', 'oz water', 'ml water', 'glasses water', 'hydrat']
+MOOD_KEYWORDS    = ['mood', 'feel', 'feeling', 'energy', 'stress', 'tired', 'great', 'good', 'bad', 'anxious']
 
-FOOD_SYSTEM = """You are a nutrition analyst for FitLogs, an SMS health tracking app for personal trainers and their clients.
-The user has described a meal in text. Estimate nutrition and respond ONLY with JSON — no markdown, no preamble.
+def classify_log(body):
+    """Classify the SMS log entry into a fitness category."""
+    lower = body.lower()
+    if any(k in lower for k in WORKOUT_KEYWORDS): return 'workout'
+    if any(k in lower for k in SLEEP_KEYWORDS):   return 'sleep'
+    if any(k in lower for k in STEPS_KEYWORDS):   return 'movement'
+    if any(k in lower for k in WEIGHT_KEYWORDS):  return 'weight'
+    if any(k in lower for k in WATER_KEYWORDS):   return 'water'
+    if any(k in lower for k in FOOD_KEYWORDS):    return 'food'
+    if any(k in lower for k in MOOD_KEYWORDS):    return 'mood'
+    return 'general'
 
-{
-  "meal_description": "clean summary of what was described",
-  "estimated_calories": 450,
-  "protein_g": 35,
-  "carbs_g": 40,
-  "fat_g": 12,
-  "confidence": "high|medium|low",
-  "notes": "brief note about assumptions or uncertainties"
-}
+def extract_numbers(text):
+    """Extract first number found in text."""
+    nums = re.findall(r'\d+\.?\d*', text)
+    return float(nums[0]) if nums else None
 
-Rules:
-- Be conservative on calories — users can edit up
-- Always estimate, never refuse
-- Use standard portions for named restaurant dishes
-- confidence: high if specific, medium if vague, low if very unclear"""
+def ai_coach_reply(body, log_type, phone):
+    """Get a brief AI coach reply for the logged entry."""
+    try:
+        # Get last 5 logs for context
+        recent = list(db.collection('users').document(phone)
+                        .collection('logs').order_by('timestamp', direction='DESCENDING')
+                        .limit(5).stream())
+        ctx = '\n'.join([f"- {r.to_dict().get('body','')}" for r in recent])
 
-COACH_SYSTEM = """You are an empathetic, knowledgeable AI health coach for FitLogs.
-You support clients of personal trainers in staying consistent with their health goals.
+        msg = claude_client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=120,
+            system=(
+                "You are a supportive, concise SMS fitness coach. "
+                "Reply in 1-2 short sentences max. Be encouraging, specific, and practical. "
+                "Never exceed 160 characters if possible. No emojis unless the user used them."
+            ),
+            messages=[{"role": "user", "content": (
+                f"User logged ({log_type}): {body}\n"
+                f"Recent logs:\n{ctx}\n"
+                "Give a brief coach response."
+            )}]
+        )
+        return msg.content[0].text.strip()
+    except Exception as e:
+        app.logger.error(f"AI coach reply error: {e}")
+        return None
 
-Your personality:
-- Warm, encouraging, and non-judgmental
-- Direct and practical — no fluff
-- You remember context from this conversation
-- You celebrate small wins genuinely
-- You ask one good follow-up question at a time
-- You never diagnose or prescribe medically
-
-Your role:
-- Help users stay motivated and consistent
-- Provide practical advice on nutrition, sleep, exercise, recovery
-- Gently challenge excuses while validating feelings
-- Connect today's behavior to their stated goals
-- Keep responses concise — this is SMS, not an essay
-
-If the user describes a food or asks about calories, give a brief estimate but stay in coaching mode.
-If the user seems to be logging data (steps, sleep, water), acknowledge it warmly and ask how they are feeling.
-Never say you are an AI unless directly asked. Respond as a coach would."""
-
-BODY_SYSTEM = """You are a health progress coach for FitLogs.
-The user has described their physical progress or how they are feeling in text.
-Respond ONLY with JSON — no markdown, no preamble.
-
-{
-  "observation": "acknowledge what they described, reframe constructively",
-  "progress_note": "encouraging observation about their direction",
-  "recommendation": "one specific, actionable suggestion",
-  "sentiment": "positive|neutral|needs_encouragement"
-}
-
-Rules:
-- Always encouraging — focus on effort and direction
-- Never comment on weight negatively
-- No medical claims
-- Grounded in what they actually described"""
-
-# ── Helpers ───────────────────────────────────────────────────────
-
-def now_utc():
-    return datetime.now(timezone.utc)
-
-def get_user(phone: str) -> dict | None:
-    """Get user by phone. Returns None if not registered."""
-    query = db.collection("users").where(
-        filter=firestore.FieldFilter("phone", "==", phone)
-    ).limit(1).get()
-    if query:
-        doc = query[0]
-        return {"id": doc.id, **doc.to_dict()}
+# ── Stripe helpers ───────────────────────────────────────────────────────────
+def find_phone_by_email(email):
+    try:
+        email_docs = db.collection_group('emails').where(
+            filter=firestore.field_filter('email', '==', email)
+        ).limit(5).stream()
+        for doc in email_docs:
+            path_parts = doc.reference.path.split('/')
+            if len(path_parts) >= 2 and path_parts[0] == 'users':
+                return path_parts[1]
+    except Exception as e:
+        app.logger.error(f"find_phone_by_email error: {e}")
     return None
 
-def create_user(phone: str) -> dict:
-    """Create new user on first contact — unverified until they sign up at fitlogs.ai."""
-    user_id = str(uuid.uuid4())
-    user_data = {
-        "phone": phone,
-        "created_at": now_utc(),
-        "tier": "unregistered",
-        "onboarding_step": 1,
-        "goals": {"daily_calories": 2000, "daily_steps": 10000, "goal_description": ""},
-        "health_metrics": {
-            "nutrition": 0, "training": 0, "cardio": 0,
-            "sleep": 0, "hydration": 0, "adherence": 0, "recovery": 0
-        }
+def upgrade_user_plan(email, plan, subscription_id=None):
+    phone = find_phone_by_email(email)
+    if not phone:
+        app.logger.error(f"upgrade_user_plan: no phone found for {email}")
+        return
+    profile_ref = db.collection('users').document(phone).collection('profile').document('data')
+    update_data = {
+        'plan': plan,
+        'planUpdatedAt': firestore.SERVER_TIMESTAMP,
+        'stripeEmail': email,
     }
-    db.collection("users").document(user_id).set(user_data)
-    return {"id": user_id, **user_data}
+    if subscription_id:
+        update_data['stripeSubscriptionId'] = subscription_id
+    profile_ref.set(update_data, merge=True)
+    app.logger.info(f"Upgraded {phone} to {plan}")
 
-def get_or_create_user(phone: str) -> dict:
-    user = get_user(phone)
-    return user if user else create_user(phone)
-
-def save_log(user_id: str, log_type: str, data: dict) -> str:
-    """Save text-only log entry. Strips any binary data at storage layer."""
-    forbidden = ["image","photo","media","binary","bytes","blob","base64",
-                 "image_data","image_bytes","file","attachment","video","audio"]
-    clean = {k: v for k, v in data.items()
-             if not any(f in k.lower() for f in forbidden)
-             and not isinstance(v, (bytes, bytearray))}
-    log_id = str(uuid.uuid4())
-    db.collection("users").document(user_id).collection("logs").document(log_id).set({
-        "id": log_id, "type": log_type, "timestamp": now_utc(), "source": "sms", **clean
-    })
-    return log_id
-
-def get_pending(user_id: str) -> dict | None:
-    ref = db.collection("users").document(user_id).collection("pending").document("confirmation")
-    doc = ref.get()
-    return doc.to_dict() if doc.exists else None
-
-def set_pending(user_id: str, data: dict):
-    db.collection("users").document(user_id).collection("pending").document("confirmation").set(
-        {**data, "created_at": now_utc()}
-    )
-
-def clear_pending(user_id: str):
-    db.collection("users").document(user_id).collection("pending").document("confirmation").delete()
-
-def get_coach_history(user_id: str, limit: int = 10) -> list:
-    """Get recent coach conversation history for context."""
-    docs = db.collection("users").document(user_id).collection("coach_history")\
-        .order_by("timestamp", direction=firestore.Query.DESCENDING).limit(limit).get()
-    history = [{"role": d.get("role"), "content": d.get("content")} for d in reversed(docs)]
-    return history
-
-def save_coach_message(user_id: str, role: str, content: str):
-    db.collection("users").document(user_id).collection("coach_history").add({
-        "role": role, "content": content, "timestamp": now_utc()
-    })
-
-def get_recent_logs_summary(user_id: str) -> str:
-    """Pull recent logs to give Claude coach context about the user."""
+# ── Stripe webhook ───────────────────────────────────────────────────────────
+@app.route("/stripe/webhook", methods=["POST"])
+def stripe_webhook():
+    payload    = request.get_data()
+    sig_header = request.headers.get("Stripe-Signature", "")
     try:
-        docs = db.collection("users").document(user_id).collection("logs")\
-            .order_by("timestamp", direction=firestore.Query.DESCENDING).limit(10).get()
-        if not docs:
-            return "No recent logs."
-        summary = []
-        for doc in docs:
-            d = doc.to_dict()
-            t = d.get("type", "")
-            if t == "food":
-                summary.append(f"Food: {d.get('meal_description','')} ~{d.get('estimated_calories',0)} kcal")
-            elif t == "steps":
-                summary.append(f"Steps: {d.get('steps',0):,}")
-            elif t == "sleep":
-                summary.append(f"Sleep: {d.get('hours',0)} hrs")
-            elif t == "hydration":
-                summary.append(f"Water: {d.get('amount',0)}{d.get('unit','L')}")
-            elif t == "routine":
-                summary.append(f"Routine: {d.get('routine_type','')}")
-            elif t == "weight":
-                summary.append(f"Weight: {d.get('weight',0)} {d.get('unit','lbs')}")
-        return " | ".join(summary[:6]) if summary else "No recent logs."
-    except Exception:
-        return "No recent logs."
+        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+    except stripe.error.SignatureVerificationError as e:
+        app.logger.error(f"Stripe sig error: {e}")
+        return jsonify({"error": "Invalid signature"}), 400
 
-# ── Claude calls ──────────────────────────────────────────────────
+    et  = event["type"]
+    obj = event["data"]["object"]
 
-def analyze_food_text(description: str) -> dict:
-    response = claude.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=400,
-        system=FOOD_SYSTEM,
-        messages=[{"role": "user", "content": f"Estimate nutrition for: {description}"}]
-    )
-    raw = re.sub(r"```json|```", "", response.content[0].text.strip()).strip()
-    return json.loads(raw)
+    if et == "checkout.session.completed":
+        email = obj.get("customer_email") or obj.get("customer_details", {}).get("email")
+        meta  = obj.get("metadata", {})
+        plan  = meta.get("plan", "coach")
+        sub_id = obj.get("subscription")
+        if email:
+            upgrade_user_plan(email, plan, sub_id)
 
-def analyze_body_text(description: str, user_goal: str) -> dict:
-    response = claude.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=400,
-        system=BODY_SYSTEM,
-        messages=[{"role": "user", "content": f"Goal: {user_goal or 'general health'}\nUser: {description}"}]
-    )
-    raw = re.sub(r"```json|```", "", response.content[0].text.strip()).strip()
-    return json.loads(raw)
-
-def coach_reply(user_id: str, user_message: str, user_goal: str) -> str:
-    """Generate empathetic coach reply with conversation history and log context."""
-    history = get_coach_history(user_id, limit=8)
-    recent_logs = get_recent_logs_summary(user_id)
-
-    system = COACH_SYSTEM + f"\n\nUser's recent activity: {recent_logs}"
-    if user_goal:
-        system += f"\nUser's stated goal: {user_goal}"
-
-    messages = history + [{"role": "user", "content": user_message}]
-
-    response = claude.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=300,
-        system=system,
-        messages=messages
-    )
-    reply = response.content[0].text.strip()
-
-    # Save both sides to history
-    save_coach_message(user_id, "user", user_message)
-    save_coach_message(user_id, "assistant", reply)
-
-    return reply
-
-# ── Parsers ───────────────────────────────────────────────────────
-
-STEP_PATTERN   = re.compile(r"(?:steps?|walked?|step count)[:\s]+(\d[\d,]*)", re.IGNORECASE)
-SLEEP_PATTERN  = re.compile(r"(\d+(?:\.\d+)?)\s*(?:hr|hour|hrs|hours?)\s*(?:of\s*)?sleep|slept\s+(\d+(?:\.\d+)?)\s*(?:hr|hour|hrs|hours?)", re.IGNORECASE)
-WATER_PATTERN  = re.compile(r"(\d+(?:\.\d+)?)\s*(?:l|liter|liters?|oz|ounces?)\s*(?:of\s*)?(?:water|h2o)", re.IGNORECASE)
-WEIGHT_PATTERN = re.compile(r"(?:weight|weigh)[:\s]+(\d+(?:\.\d+)?)\s*(?:lbs?|kg|pounds?|kilos?)", re.IGNORECASE)
-
-FOOD_WORDS = (
-    "breakfast","lunch","dinner","snack","meal","ate","eating","had","food",
-    "drink","drank","coffee","smoothie","shake","burger","pizza","salad",
-    "sandwich","soup","pasta","rice","chicken","beef","fish","eggs","oatmeal",
-    "yogurt","fruit","bar","protein","calories","kcal","toast","wrap","bowl"
-)
-BODY_WORDS = (
-    "check-in","checkin","check in","progress","body","feeling","noticing",
-    "looking","physique","shape","muscles","stronger","leaner","gaining",
-    "losing","building","sore","tired","energized","motivated","sluggish"
-)
-ROUTINE_MAP = {
-    "gym":"strength","weights":"strength","lifting":"strength","strength":"strength",
-    "resistance":"strength","bench":"strength","squat":"strength","deadlift":"strength",
-    "cardio":"cardio","run":"cardio","running":"cardio","jog":"cardio","jogging":"cardio",
-    "bike":"cardio","cycling":"cardio","swim":"cardio","swimming":"cardio",
-    "hiit":"cardio","treadmill":"cardio","elliptical":"cardio","walk":"cardio",
-    "yoga":"flexibility","stretch":"flexibility","stretching":"flexibility",
-    "pilates":"flexibility","mobility":"flexibility",
-    "vitamins":"vitamins","vitamin":"vitamins","supplements":"vitamins","creatine":"vitamins",
-    "meditation":"mindfulness","meditate":"mindfulness","breathwork":"mindfulness",
-    "rest day":"rest_day","rest":"rest_day","recovery":"rest_day","off day":"rest_day",
-}
-
-def parse_steps(body):
-    m = STEP_PATTERN.search(body)
-    return int(m.group(1).replace(",","")) if m else None
-
-def parse_sleep(body):
-    m = SLEEP_PATTERN.search(body)
-    if m:
-        val = m.group(1) or m.group(2)
-        return float(val) if val else None
-    return None
-
-def parse_water(body):
-    m = WATER_PATTERN.search(body)
-    if m:
-        unit = "oz" if "oz" in m.group(2).lower() else "L"
-        return float(m.group(1)), unit
-    return None
-
-def parse_weight(body):
-    m = WEIGHT_PATTERN.search(body)
-    if m:
-        unit = "lbs" if any(u in m.group(0).lower() for u in ["lb","pound"]) else "kg"
-        return float(m.group(1)), unit
-    return None
-
-def parse_routines(body):
-    found = []
-    bl = body.lower()
-    for kw, rt in ROUTINE_MAP.items():
-        if kw in bl and rt not in found:
-            found.append(rt)
-    return found
-
-def is_food(body):
-    bl = body.lower()
-    return any(w in bl for w in FOOD_WORDS)
-
-def is_body_checkin(body):
-    bl = body.lower()
-    return any(w in bl for w in BODY_WORDS)
-
-def is_conversational(body):
-    """Detect messages that are clearly conversational rather than logging."""
-    triggers = ["feel","help","motivat","struggle","hard","difficult","why","how do","should i",
-                "advice","tip","skipped","missed","can't","cannot","worried","scared","excited",
-                "proud","happy","sad","frustrated","?"]
-    bl = body.lower()
-    return any(t in bl for t in triggers) or body.strip().endswith("?")
-
-# ── Response builders ─────────────────────────────────────────────
-
-def food_confirm_msg(a):
-    conf = a.get("confidence","medium")
-    tag = "" if conf=="high" else f" ({conf} confidence)"
-    notes = a.get("notes","")
-    nl = f"\n📌 {notes}" if notes else ""
-    return (
-        f"🍽 Nutrition Estimate{tag}\n\n"
-        f"📋 {a.get('meal_description','Your meal')}\n"
-        f"🔥 ~{a.get('estimated_calories','?')} kcal\n"
-        f"💪 Protein: {a.get('protein_g','?')}g\n"
-        f"🌾 Carbs: {a.get('carbs_g','?')}g\n"
-        f"🥑 Fat: {a.get('fat_g','?')}g{nl}\n\n"
-        f"Reply CONFIRM to save or CALORIES 520 to correct."
-    )
-
-def body_confirm_msg(a):
-    return (
-        f"💪 Progress Note\n\n"
-        f"🔍 {a.get('observation','')}\n\n"
-        f"📈 {a.get('progress_note','')}\n\n"
-        f"💡 {a.get('recommendation','')}\n\n"
-        f"Reply CONFIRM to save or DISCARD to skip."
-    )
-
-def steps_msg(steps, goal=10000):
-    pct = min(int(steps/goal*100),100)
-    bar = "█"*(pct//10) + "░"*(10-pct//10)
-    done = "🎯 Goal reached!" if steps>=goal else f"{goal-steps:,} to go"
-    return f"🚶 {steps:,} steps logged\n{bar} {pct}%\n{done}"
-
-WELCOME_MSG = (
-    "👋 Welcome to FitLogs!\n\n"
-    "Sign up for your 30-day free trial at:\n"
-    f"{FITLOGS_URL}\n\n"
-    "Once registered, text anything to log it:\n"
-    "🍽 'lunch grilled chicken rice'\n"
-    "🚶 'steps 8432'\n"
-    "😴 'slept 7 hours'\n"
-    "🏋 'gym 45min strength'\n"
-    "💬 Or just talk to your AI coach"
-)
-
-SECOND_MSG = (
-    "🎉 Welcome to FitLogs Coach!\n\n"
-    "Your 30-day free trial has started.\n\n"
-    "You're on the Coach plan ($19.99/mo) which includes:\n"
-    "✓ Real-time AI coaching conversations\n"
-    "✓ Full dashboard at fitlogs.ai\n"
-    "✓ AI calorie estimates from text\n"
-    "✓ Weekly AI progress reports\n\n"
-    "Text DOWNGRADE to switch to Track ($9.99/mo)\n"
-    "Text STOP to cancel anytime\n"
-    "No charge for 30 days.\n\n"
-    "Now — what's your main health goal? Tell me and let's get started."
-)
-
-HELP_MSG = (
-    "📋 FitLogs Help\n\n"
-    "🍽 FOOD: describe your meal\n"
-    "   'lunch chicken rice broccoli'\n\n"
-    "🚶 STEPS: 'steps 8432'\n"
-    "😴 SLEEP: 'slept 7 hours'\n"
-    "💧 WATER: '2L water'\n"
-    "🏋 WORKOUT: 'gym 45min strength'\n"
-    "💊 HEALTH: 'vitamins taken'\n"
-    "💬 COACH: just talk naturally\n\n"
-    "CONFIRM — save pending entry\n"
-    "DISCARD — discard pending entry\n"
-    "CALORIES N — correct calorie estimate\n"
-    "DOWNGRADE — switch to Track ($9.99)\n"
-    "STOP — cancel subscription\n\n"
-    f"Dashboard: {FITLOGS_URL}"
-)
-
-MMS_MSG = (
-    "📵 FitLogs is text-only.\n\n"
-    "To log food, describe it:\n"
-    "'lunch grilled chicken rice salad'\n\n"
-    "AI estimates calories from your description.\n"
-    "Photo upload coming in a future version."
-)
-
-# ── Main webhook ──────────────────────────────────────────────────
-
-@app.route("/sms", methods=["POST"])
-def sms_webhook():
-    if VALIDATE_TWILIO:
-        validator = RequestValidator(TWILIO_AUTH_TOKEN)
-        sig = request.headers.get("X-Twilio-Signature","")
-        if not validator.validate(request.url, request.form, sig):
-            return jsonify({"error":"Invalid signature"}), 403
-
-    from_number = request.form.get("From","")
-    body        = request.form.get("Body","").strip()
-    num_media   = int(request.form.get("NumMedia",0))
-    resp        = MessagingResponse()
-
-    if not from_number:
-        return str(resp), 200
-
-    # ── HARD BLOCK: MMS ───────────────────────────────────────────
-    if num_media > 0:
-        resp.message(MMS_MSG)
-        return str(resp), 200
-
-    body_upper = body.upper().strip()
-
-    # ── UNREGISTERED USER ─────────────────────────────────────────
-    user = get_or_create_user(from_number)
-    user_id   = user["id"]
-    user_tier = user.get("tier","unregistered")
-    user_goal = user.get("goals",{}).get("goal_description","")
-
-    if user_tier == "unregistered":
-        step = user.get("onboarding_step", 1)
-        if step == 1:
-            # First ever message
-            db.collection("users").document(user_id).update({"onboarding_step": 2})
-            resp.message(WELCOME_MSG)
-        else:
-            # Second message — they came back, treat as signed up for demo
-            # In production this checks Firebase Auth for completed signup
-            db.collection("users").document(user_id).update({
-                "tier": "coach",
-                "onboarding_step": 3
-            })
-            resp.message(SECOND_MSG)
-        return str(resp), 200
-
-    # ── REGISTERED USER COMMANDS ──────────────────────────────────
-
-    if body_upper in ("HELP","?"):
-        resp.message(HELP_MSG)
-        return str(resp), 200
-
-    if body_upper == "CONFIRM":
-        pending = get_pending(user_id)
-        if pending:
-            save_log(user_id, pending["type"], pending["data"])
-            clear_pending(user_id)
-            msg = "✅ Saved to your FitLogs dashboard."
-            if user_tier in ("coach","trainer"):
-                msg += "\n\nAnything else on your mind?"
-            resp.message(msg)
-        else:
-            resp.message("Nothing pending to confirm.")
-        return str(resp), 200
-
-    if body_upper == "DISCARD":
-        clear_pending(user_id)
-        resp.message("Entry discarded. Nothing saved.")
-        return str(resp), 200
-
-    if body_upper == "DOWNGRADE":
-        db.collection("users").document(user_id).update({"tier": "track"})
-        resp.message("✅ Switched to Track ($9.99/mo). AI coaching conversations are paused but all logging continues. Text UPGRADE to switch back anytime.")
-        return str(resp), 200
-
-    if body_upper == "UPGRADE":
-        db.collection("users").document(user_id).update({"tier": "coach"})
-        resp.message("✅ Upgraded to Coach ($19.99/mo). Real-time AI coaching is now active. What's your goal?")
-        return str(resp), 200
-
-    cal_match = re.match(r"CALORIES?\s+(\d+)", body_upper)
-    if cal_match:
-        pending = get_pending(user_id)
-        if pending and pending.get("type") == "food":
-            pending["data"]["estimated_calories"] = int(cal_match.group(1))
-            pending["data"]["user_edited"] = True
-            set_pending(user_id, pending)
-            resp.message(f"Updated to {cal_match.group(1)} kcal. Reply CONFIRM to save.")
-        else:
-            resp.message("No pending food entry to update.")
-        return str(resp), 200
-
-    # ── STEPS ──────────────────────────────────────────────────────
-    steps = parse_steps(body)
-    if steps is not None:
-        goal = user.get("goals",{}).get("daily_steps",10000)
-        save_log(user_id, "steps", {"steps": steps, "goal": goal})
-        msg = steps_msg(steps, goal)
-        if user_tier in ("coach","trainer"):
-            msg += "\n\nKeep it moving! 💪"
-        resp.message(msg)
-        return str(resp), 200
-
-    # ── MULTI-LOG: sleep + water + weight + routines ───────────────
-    logged = []
-    emoji_map = {"strength":"🏋","cardio":"🫁","flexibility":"🧘",
-                 "vitamins":"💊","mindfulness":"🧠","rest_day":"🛌"}
-
-    s = parse_sleep(body)
-    if s is not None:
-        save_log(user_id, "sleep", {"hours": s})
-        logged.append(f"😴 {s} hrs sleep")
-
-    w = parse_water(body)
-    if w:
-        amt, unit = w
-        save_log(user_id, "hydration", {"amount": amt, "unit": unit})
-        logged.append(f"💧 {amt}{unit} water")
-
-    wt = parse_weight(body)
-    if wt:
-        amt, unit = wt
-        save_log(user_id, "weight", {"weight": amt, "unit": unit})
-        logged.append(f"⚖️ {amt} {unit}")
-
-    for r in parse_routines(body):
-        save_log(user_id, "routine", {"routine_type": r, "raw_text": body})
-        logged.append(f"{emoji_map.get(r,'✅')} {r.replace('_',' ').title()}")
-
-    if logged:
-        msg = "✅ Logged:\n" + "\n".join(logged)
-        if user_tier in ("coach","trainer"):
-            msg += "\n\nSolid consistency. How are you feeling after?"
-        resp.message(msg)
-        return str(resp), 200
-
-    # ── COACH TIER: conversational AI ─────────────────────────────
-    if user_tier in ("coach","trainer") and is_conversational(body):
+    elif et in ("customer.subscription.updated", "customer.subscription.deleted"):
+        status = obj.get("status")
+        sub_id = obj.get("id")
+        plan = "track" if et == "customer.subscription.deleted" else obj.get("metadata", {}).get("plan", "coach")
         try:
-            reply = coach_reply(user_id, body, user_goal)
+            customer = stripe.Customer.retrieve(obj.get("customer"))
+            email = customer.get("email")
+            if email:
+                upgrade_user_plan(email, plan, sub_id)
+        except Exception as e:
+            app.logger.error(f"Stripe customer retrieve error: {e}")
+
+    return jsonify({"status": "ok"}), 200
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+def enc(email):
+    return email.replace('.', '_dot_').replace('@', '_at_')
+
+def find_email_key(phone):
+    try:
+        docs = list(db.collection('users').document(phone)
+                      .collection('emails').stream())
+        if docs:
+            return docs[0].id
+    except Exception as e:
+        app.logger.error(f"find_email_key error: {e}")
+    return enc(phone)
+
+def valid_twilio(req):
+    if not VALIDATE_TWILIO:
+        return True
+    v = RequestValidator(TWILIO_AUTH_TOKEN)
+    url = req.url
+    return v.validate(url, req.form, req.headers.get('X-Twilio-Signature', ''))
+
+# ── Inbound SMS ──────────────────────────────────────────────────────────────
+@app.route("/sms/inbound", methods=["POST"])
+def inbound_sms():
+    if not valid_twilio(request):
+        return jsonify({"error": "Forbidden"}), 403
+
+    phone   = request.form.get("From", "").strip()
+    body    = request.form.get("Body", "").strip()
+    sid     = request.form.get("MessageSid")
+
+    app.logger.info(f"Inbound SMS — From: '{phone}' Body: '{body[:60]}' SID: {sid}")
+
+    resp = MessagingResponse()
+
+    if not phone:
+        resp.message("Unable to process — sender phone number not detected.")
+        return str(resp), 200, {"Content-Type": "text/xml"}
+
+    upper = body.upper().strip()
+
+    # ── STOP ──
+    if upper == "STOP":
+        resp.message("You have been unsubscribed from FitLogs. Reply START to re-subscribe.")
+        return str(resp), 200, {"Content-Type": "text/xml"}
+
+    # ── START ──
+    if upper == "START":
+        resp.message("Welcome back to FitLogs! 💪 Text your meals, steps, sleep, or workouts anytime. Reply HELP for commands.")
+        return str(resp), 200, {"Content-Type": "text/xml"}
+
+    # ── HELP ──
+    if upper == "HELP":
+        resp.message(
+            "FitLogs commands:\n"
+            "• Log food: 'Had oatmeal and coffee'\n"
+            "• Log steps: 'Walked 8000 steps'\n"
+            "• Log sleep: 'Slept 7 hrs'\n"
+            "• Log workout: 'Gym 45min, chest day'\n"
+            "• SUMMARY — today's summary\n"
+            "• COACH [question] — ask your AI coach\n"
+            "Reply STOP to unsubscribe."
+        )
+        return str(resp), 200, {"Content-Type": "text/xml"}
+
+    # ── SUMMARY ──
+    if upper == "SUMMARY":
+        try:
+            today_str = datetime.now(timezone.utc).date().isoformat()
+            logs = [
+                r.to_dict() for r in
+                db.collection('users').document(phone).collection('logs').stream()
+                if (r.to_dict().get('timestampLocal') or '')[:10] == today_str
+            ]
+            if not logs:
+                resp.message("No logs yet today. Text your meals, steps, or workouts to get started!")
+            else:
+                lines = [f"Today's FitLogs ({today_str}):"]
+                for log in logs[-5:]:
+                    t = (log.get('timestampLocal') or '')[11:16]
+                    b = (log.get('body') or '')[:60]
+                    lines.append(f"• [{t}] {b}")
+                resp.message('\n'.join(lines))
+        except Exception as e:
+            app.logger.error(f"Summary error: {e}")
+            resp.message("Could not fetch summary. Try again later.")
+        return str(resp), 200, {"Content-Type": "text/xml"}
+
+    # ── COACH question ──
+    if upper.startswith("COACH ") or upper.startswith("COACH:"):
+        question = body[6:].strip()
+        if not question:
+            resp.message("What would you like to ask your coach? Try: COACH How much protein should I eat?")
+            return str(resp), 200, {"Content-Type": "text/xml"}
+        try:
+            msg = claude_client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=200,
+                system=(
+                    "You are a knowledgeable, supportive fitness coach replying via SMS. "
+                    "Keep replies under 200 characters. Be direct and practical."
+                ),
+                messages=[{"role": "user", "content": question}]
+            )
+            reply = msg.content[0].text.strip()
             resp.message(reply)
         except Exception as e:
-            resp.message(f"I'm here — try again in a moment.\n{str(e)[:60]}")
-        return str(resp), 200
+            app.logger.error(f"Coach reply error: {e}")
+            resp.message("Your coach is unavailable right now. Try again in a moment.")
+        return str(resp), 200, {"Content-Type": "text/xml"}
 
-    # ── BODY CHECK-IN ──────────────────────────────────────────────
-    if is_body_checkin(body):
-        try:
-            analysis = analyze_body_text(body, user_goal)
-            set_pending(user_id, {
-                "type": "body_checkin",
-                "data": {
-                    "observation": analysis.get("observation",""),
-                    "progress_note": analysis.get("progress_note",""),
-                    "recommendation": analysis.get("recommendation",""),
-                    "sentiment": analysis.get("sentiment","neutral"),
-                    "user_description": body,
-                    "user_goal": user_goal,
-                    "ai_analyzed": True
-                }
-            })
-            resp.message(body_confirm_msg(analysis))
-        except Exception as e:
-            resp.message(f"Could not analyze check-in. Try again.\n{str(e)[:60]}")
-        return str(resp), 200
+    # ── Standard fitness log ──
+    log_type = classify_log(body)
+    value    = extract_numbers(body)
 
-    # ── FOOD ENTRY ─────────────────────────────────────────────────
-    if is_food(body) or len(body.split()) >= 3:
-        try:
-            analysis = analyze_food_text(body)
-            set_pending(user_id, {
-                "type": "food",
-                "data": {
-                    "meal_description": analysis.get("meal_description",""),
-                    "estimated_calories": analysis.get("estimated_calories",0),
-                    "protein_g": analysis.get("protein_g",0),
-                    "carbs_g": analysis.get("carbs_g",0),
-                    "fat_g": analysis.get("fat_g",0),
-                    "confidence": analysis.get("confidence","medium"),
-                    "notes": analysis.get("notes",""),
-                    "raw_text": body,
-                    "ai_analyzed": True,
-                    "user_edited": False
-                }
-            })
-            resp.message(food_confirm_msg(analysis))
-        except Exception as e:
-            resp.message(f"Could not estimate nutrition. Try again.\n{str(e)[:60]}")
-        return str(resp), 200
+    log_record = {
+        "body":           body,
+        "messageSid":     sid,
+        "from":           phone,
+        "timestamp":      firestore.SERVER_TIMESTAMP,
+        "timestampLocal": datetime.now(timezone.utc).isoformat(),
+        "source":         "sms",
+        "type":           log_type,
+        "value":          value,
+    }
 
-    # ── COACH TIER FALLBACK: route to AI coach ─────────────────────
-    if user_tier in ("coach","trainer"):
-        try:
-            reply = coach_reply(user_id, body, user_goal)
-            resp.message(reply)
-        except Exception as e:
-            resp.message(f"I'm here — try again in a moment.\n{str(e)[:60]}")
-        return str(resp), 200
+    try:
+        email_key = find_email_key(phone)
+        db.collection('users').document(phone).collection('emails').document(email_key).collection('logs').document(sid).set(log_record)
+        db.collection('users').document(phone).collection('logs').document(sid).set(log_record)
+        app.logger.info(f"Saved log: users/{phone}/logs/{sid} type={log_type}")
+    except Exception as e:
+        app.logger.error(f"Firestore write failed: {e}")
 
-    # ── TRACK TIER FALLBACK: save as note ─────────────────────────
-    if body:
-        save_log(user_id, "note", {"text": body})
-        resp.message("📝 Note saved.\n\nReply HELP for logging options.")
+    # AI coach reply
+    coach_reply = ai_coach_reply(body, log_type, phone)
+    if coach_reply:
+        resp.message(coach_reply)
     else:
-        resp.message(HELP_MSG)
+        resp.message(f"✅ Logged to FitLogs ({log_type}). View your dashboard at fitlogs.ai")
 
-    return str(resp), 200
+    return str(resp), 200, {"Content-Type": "text/xml"}
 
-# ── Dashboard endpoints ───────────────────────────────────────────
-
-@app.route("/analyze/food", methods=["POST"])
-def analyze_food_endpoint():
-    try:
-        data = request.get_json()
-        desc = data.get("description","").strip()
-        if not desc:
-            return jsonify({"error":"No description"}), 400
-        return jsonify({"success": True, "analysis": analyze_food_text(desc)})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/coach/message", methods=["POST"])
-def coach_message_endpoint():
-    """Dashboard AI coach chat endpoint."""
-    try:
-        data      = request.get_json()
-        user_id   = data.get("user_id","")
-        message   = data.get("message","").strip()
-        user_goal = data.get("user_goal","")
-        if not user_id or not message:
-            return jsonify({"error":"Missing user_id or message"}), 400
-        reply = coach_reply(user_id, message, user_goal)
-        return jsonify({"success": True, "reply": reply})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/log/confirm", methods=["POST"])
-def confirm_log():
-    try:
-        data     = request.get_json()
-        user_id  = data.get("user_id","")
-        log_type = data.get("type","")
-        log_data = data.get("data",{})
-        if not user_id or not log_type:
-            return jsonify({"error":"Missing user_id or type"}), 400
-        log_id = save_log(user_id, log_type, {**log_data, "confirmed_via":"dashboard"})
-        return jsonify({"success": True, "log_id": log_id})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/verify/send", methods=["POST"])
+# ── Twilio Verify OTP ────────────────────────────────────────────────────────
+@app.route("/verify/send", methods=["POST", "OPTIONS"])
 def verify_send():
-    """Send OTP via Twilio Verify for signup phone verification."""
+    if request.method == "OPTIONS":
+        return '', 204
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+
+    phone = data.get("phone", "").strip()
+    if not phone:
+        return jsonify({"error": "Phone number required"}), 400
+
+    if not phone.startswith("+1") or len(phone.replace("+1","").replace(" ","").replace("-","")) != 10:
+        return jsonify({"error": "Only US phone numbers (+1) are supported"}), 400
+
+    if not VERIFY_SERVICE_SID:
+        return jsonify({"error": "Verify service not configured"}), 500
+
     try:
-        data  = request.get_json()
-        phone = data.get("phone","").strip()
-        if not phone:
-            return jsonify({"error":"Phone number required"}), 400
-
-        verify_sid = os.environ.get("TWILIO_VERIFY_SERVICE_SID","")
-        if not verify_sid:
-            return jsonify({"error":"Verify service not configured"}), 500
-
-        from twilio.rest import Client as TwilioClient
-        client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-        verification = client.verify.v2.services(verify_sid)\
+        verification = twilio_client.verify.v2.services(VERIFY_SERVICE_SID) \
             .verifications.create(to=phone, channel="sms")
-        return jsonify({"success": True, "status": verification.status})
+        app.logger.info(f"OTP sent to {phone} - status: {verification.status}")
+        return jsonify({"status": "ok", "message": "Verification code sent"}), 200
     except Exception as e:
+        app.logger.error(f"Twilio Verify send error: {e}")
         return jsonify({"error": str(e)}), 500
 
-@app.route("/verify/check", methods=["POST"])
+
+@app.route("/verify/check", methods=["POST", "OPTIONS"])
 def verify_check():
-    """Check OTP code via Twilio Verify."""
+    if request.method == "OPTIONS":
+        return '', 204
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+
+    phone = data.get("phone", "").strip()
+    code  = data.get("code", "").strip()
+
+    if not phone or not code:
+        return jsonify({"error": "Phone and code required"}), 400
+
+    if not VERIFY_SERVICE_SID:
+        return jsonify({"error": "Verify service not configured"}), 500
+
     try:
-        data  = request.get_json()
-        phone = data.get("phone","").strip()
-        code  = data.get("code","").strip()
-        if not phone or not code:
-            return jsonify({"error":"Phone and code required"}), 400
-
-        verify_sid = os.environ.get("TWILIO_VERIFY_SERVICE_SID","")
-        if not verify_sid:
-            return jsonify({"error":"Verify service not configured"}), 500
-
-        from twilio.rest import Client as TwilioClient
-        client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-        check = client.verify.v2.services(verify_sid)\
+        check = twilio_client.verify.v2.services(VERIFY_SERVICE_SID) \
             .verification_checks.create(to=phone, code=code)
+        app.logger.info(f"OTP check for {phone} - status: {check.status}")
         if check.status == "approved":
-            return jsonify({"success": True})
+            return jsonify({"status": "approved"}), 200
         else:
-            return jsonify({"success": False, "status": check.status})
+            return jsonify({"status": "rejected", "error": "Invalid or expired code"}), 400
     except Exception as e:
+        app.logger.error(f"Twilio Verify check error: {e}")
         return jsonify({"error": str(e)}), 500
 
+# ── Claude Insights / AI Coach Chat ─────────────────────────────────────────
+@app.route("/insights", methods=["POST", "OPTIONS"])
+def insights():
+    """Chat with Claude AI coach about user's fitness logs."""
+    if request.method == "OPTIONS":
+        return app.make_default_options_response()
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
 
+    phone       = data.get("phone", "").strip()
+    records_ctx = data.get("records", "")
+    messages    = data.get("messages", [])
+
+    if not phone or not messages:
+        return jsonify({"error": "Missing phone or messages"}), 400
+
+    system_prompt = f"""You are an expert AI fitness coach for FitLogs, a personal health and fitness tracking platform.
+You have access to the user's fitness logs and help them understand their progress, identify patterns, and improve their health.
+
+The user's recent log data:
+{records_ctx}
+
+Guidelines:
+- Be encouraging, specific, and actionable
+- Reference specific dates, meals, workouts, or metrics from the logs when relevant
+- Assess fitness trends: consistency, calories, sleep quality, activity levels, hydration
+- Provide practical recommendations for nutrition, recovery, and training
+- Never make medical diagnoses — suggest consulting a doctor for health concerns
+- Keep responses clear and motivating"""
+
+    try:
+        message = claude_client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1000,
+            system=system_prompt,
+            messages=messages
+        )
+        reply = message.content[0].text
+        app.logger.info(f"Insights response for {phone}: {len(reply)} chars")
+        return jsonify({"reply": reply}), 200
+    except Exception as e:
+        app.logger.error(f"Insights error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# ── Account — Update Phone ───────────────────────────────────────────────────
+@app.route("/account/update-phone", methods=["POST", "OPTIONS"])
+def update_phone():
+    if request.method == "OPTIONS":
+        return '', 204
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "No data"}), 400
+
+    old_phone = data.get("old_phone", "").strip()
+    new_phone = data.get("new_phone", "").strip()
+
+    if not old_phone or not new_phone:
+        return jsonify({"error": "Missing phone numbers"}), 400
+    if old_phone == new_phone:
+        return jsonify({"error": "New number is same as current"}), 400
+
+    app.logger.info(f"Phone migration: {old_phone} → {new_phone}")
+
+    try:
+        # 1. Copy profile
+        old_profile_ref = db.collection('users').document(old_phone).collection('profile').document('data')
+        old_profile = old_profile_ref.get()
+        if old_profile.exists:
+            profile_data = old_profile.to_dict()
+            profile_data['phone'] = new_phone
+            db.collection('users').document(new_phone).collection('profile').document('data').set(profile_data)
+
+        # 2. Copy emails subcollection
+        old_emails = db.collection('users').document(old_phone).collection('emails').stream()
+        for email_doc in old_emails:
+            db.collection('users').document(new_phone).collection('emails').document(email_doc.id).set(email_doc.to_dict())
+
+        # 3. Copy all logs
+        old_logs = db.collection('users').document(old_phone).collection('logs').stream()
+        migrated = 0
+        for log in old_logs:
+            log_data = log.to_dict()
+            log_data['from'] = new_phone
+            db.collection('users').document(new_phone).collection('logs').document(log.id).set(log_data)
+            migrated += 1
+
+        # 4. Delete old data
+        old_logs2 = db.collection('users').document(old_phone).collection('logs').stream()
+        for log in old_logs2:
+            log.reference.delete()
+
+        old_emails2 = db.collection('users').document(old_phone).collection('emails').stream()
+        for email_doc in old_emails2:
+            email_doc.reference.delete()
+
+        old_profile_ref.delete()
+        db.collection('users').document(old_phone).delete()
+
+        app.logger.info(f"Migration complete: {migrated} logs moved")
+        return jsonify({"status": "ok", "migrated": migrated}), 200
+
+    except Exception as e:
+        app.logger.error(f"Migration error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# ── Email helpers ────────────────────────────────────────────────────────────
+def send_email(to_email, subject, html_body):
+    try:
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = subject
+        msg['From']    = f"FitLogs <{ZOHO_EMAIL}>"
+        msg['To']      = to_email
+        msg.attach(MIMEText(html_body, 'html'))
+        with smtplib.SMTP_SSL(SMTP_HOST, 465) as server:
+            server.login(ZOHO_EMAIL, ZOHO_PASSWORD)
+            server.sendmail(ZOHO_EMAIL, to_email, msg.as_string())
+        app.logger.info(f"Email sent to {to_email}: {subject}")
+        return True
+    except Exception as e:
+        app.logger.error(f"Email send error to {to_email}: {e}")
+        return False
+
+def get_user_email(phone):
+    try:
+        docs = db.collection('users').document(phone).collection('emails').stream()
+        first = None
+        for doc in docs:
+            data = doc.to_dict()
+            if data.get('primary'):
+                return data.get('email', '')
+            if not first:
+                first = data.get('email', '')
+        return first or ''
+    except Exception as e:
+        app.logger.error(f"get_user_email error for {phone}: {e}")
+        return ''
+
+def build_daily_email(phone, logs, date_str):
+    count = len(logs)
+    rows = ''
+    for r in logs:
+        ts   = (r.get('timestampLocal') or '')[:16].replace('T', ' ') or 'Unknown'
+        body = (r.get('body') or '')[:120]
+        ltype = (r.get('type') or 'general').title()
+        rows += (
+            '<tr><td style="padding:10px 0;border-bottom:1px solid #e2e8f0;font-size:13px;color:#0f172a;vertical-align:top;">'
+            f'<div style="color:#64748b;font-size:11px;margin-bottom:3px;">{ts} &middot; <span style="color:#22c55e">{ltype}</span></div>'
+            f'<div>{body}</div></td></tr>'
+        )
+    return (
+        '<!DOCTYPE html><html><head><meta charset="UTF-8"></head>'
+        '<body style="margin:0;padding:0;background:#f8fafc;font-family:-apple-system,BlinkMacSystemFont,Helvetica Neue,Arial,sans-serif;">'
+        '<div style="max-width:560px;margin:32px auto;background:#ffffff;border-radius:12px;overflow:hidden;border:1px solid #e2e8f0;">'
+        '<div style="background:#15803d;padding:24px 28px;">'
+        '<span style="font-size:20px;font-weight:800;color:#ffffff;letter-spacing:-0.5px;">Fit<span style="color:#dcfce7;">Logs</span></span>'
+        '<span style="color:rgba(255,255,255,0.7);font-size:13px;margin-left:8px;">Daily Summary</span></div>'
+        '<div style="padding:24px 28px;">'
+        f'<div style="font-size:22px;font-weight:700;color:#0f172a;margin-bottom:4px;">{count} log{"s" if count != 1 else ""} today</div>'
+        f'<div style="font-size:13px;color:#64748b;margin-bottom:20px;">{date_str}</div>'
+        f'<table style="width:100%;border-collapse:collapse;">{rows}</table>'
+        '<div style="margin-top:24px;text-align:center;">'
+        '<a href="https://fitlogs.ai" style="display:inline-block;background:#22c55e;color:#000;font-weight:700;font-size:13px;padding:10px 24px;border-radius:8px;text-decoration:none;">View Dashboard</a>'
+        '</div></div>'
+        '<div style="padding:16px 28px;border-top:1px solid #e2e8f0;font-size:11px;color:#94a3b8;text-align:center;">'
+        'FitLogs &middot; Athens Innovation and Development LLC &middot; Reply STOP to unsubscribe</div>'
+        '</div></body></html>'
+    )
+
+def build_weekly_email(phone, logs, week_str):
+    count = len(logs)
+    try:
+        logs_ctx = '\n'.join([
+            f"[{(r.get('timestampLocal') or '')[:10]}] ({r.get('type','general')}) {(r.get('body') or '')[:150]}"
+            for r in logs[:50]
+        ])
+        msg = claude_client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=400,
+            messages=[{"role": "user", "content": (
+                "Summarize this week's fitness logs in 3-4 sentences as a supportive coach. "
+                "Note consistency, highlights, and one actionable tip for next week.\n\n"
+                f"Logs:\n{logs_ctx}"
+            )}]
+        )
+        summary_text = msg.content[0].text
+    except Exception as e:
+        app.logger.error(f"Weekly Claude error: {e}")
+        summary_text = f"{count} fitness activities logged this week. Keep it up!"
+
+    return (
+        '<!DOCTYPE html><html><head><meta charset="UTF-8"></head>'
+        '<body style="margin:0;padding:0;background:#f8fafc;font-family:-apple-system,BlinkMacSystemFont,Helvetica Neue,Arial,sans-serif;">'
+        '<div style="max-width:560px;margin:32px auto;background:#ffffff;border-radius:12px;overflow:hidden;border:1px solid #e2e8f0;">'
+        '<div style="background:#15803d;padding:24px 28px;">'
+        '<span style="font-size:20px;font-weight:800;color:#ffffff;">Fit<span style="color:#dcfce7;">Logs</span></span>'
+        '<span style="color:rgba(255,255,255,0.7);font-size:13px;margin-left:8px;">Weekly Digest</span></div>'
+        '<div style="padding:24px 28px;">'
+        f'<div style="font-size:22px;font-weight:700;color:#0f172a;margin-bottom:4px;">{count} log{"s" if count != 1 else ""} this week</div>'
+        f'<div style="font-size:13px;color:#64748b;margin-bottom:20px;">{week_str}</div>'
+        f'<div style="background:#f0fdf4;border-left:3px solid #22c55e;padding:14px 16px;border-radius:0 8px 8px 0;font-size:13px;color:#0f172a;line-height:1.7;margin-bottom:16px;">{summary_text}</div>'
+        '<div style="margin-top:24px;text-align:center;">'
+        '<a href="https://fitlogs.ai" style="display:inline-block;background:#22c55e;color:#000;font-weight:700;font-size:13px;padding:10px 24px;border-radius:8px;text-decoration:none;">View Dashboard</a>'
+        '</div></div>'
+        '<div style="padding:16px 28px;border-top:1px solid #e2e8f0;font-size:11px;color:#94a3b8;text-align:center;">'
+        'FitLogs &middot; Athens Innovation and Development LLC &middot; Reply STOP to unsubscribe</div>'
+        '</div></body></html>'
+    )
+
+def send_daily_summaries():
+    app.logger.info("FitLogs daily summary job started")
+    today     = datetime.now(timezone.utc).date()
+    today_str = today.isoformat()
+    sent = 0
+    try:
+        for user_doc in db.collection('users').stream():
+            phone = user_doc.id
+            if not phone.startswith('+'):
+                continue
+            try:
+                todays = [
+                    r.to_dict() for r in
+                    db.collection('users').document(phone).collection('logs').stream()
+                    if (r.to_dict().get('timestampLocal') or '')[:10] == today_str
+                ]
+                if not todays:
+                    continue
+                email = get_user_email(phone)
+                if not email:
+                    continue
+                date_display = today.strftime('%A, %B %d, %Y')
+                html = build_daily_email(phone, todays, date_display)
+                if send_email(email, f"FitLogs Daily Summary - {date_display}", html):
+                    sent += 1
+            except Exception as e:
+                app.logger.error(f"Daily summary error {phone}: {e}")
+    except Exception as e:
+        app.logger.error(f"Daily summary job error: {e}")
+    app.logger.info(f"Daily summary complete - {sent} emails sent")
+
+def send_weekly_digests():
+    app.logger.info("FitLogs weekly digest job started")
+    today      = datetime.now(timezone.utc).date()
+    week_start = today - timedelta(days=7)
+    sent = 0
+    try:
+        for user_doc in db.collection('users').stream():
+            phone = user_doc.id
+            if not phone.startswith('+'):
+                continue
+            try:
+                weeks = [
+                    r.to_dict() for r in
+                    db.collection('users').document(phone).collection('logs').stream()
+                    if week_start.isoformat() <= (r.to_dict().get('timestampLocal') or '')[:10] <= today.isoformat()
+                ]
+                if not weeks:
+                    continue
+                email = get_user_email(phone)
+                if not email:
+                    continue
+                week_str = f"{week_start.strftime('%b %d')} - {today.strftime('%b %d, %Y')}"
+                html = build_weekly_email(phone, weeks, week_str)
+                if send_email(email, f"FitLogs Weekly Digest - {week_str}", html):
+                    sent += 1
+            except Exception as e:
+                app.logger.error(f"Weekly digest error {phone}: {e}")
+    except Exception as e:
+        app.logger.error(f"Weekly digest job error: {e}")
+    app.logger.info(f"Weekly digest complete - {sent} emails sent")
+
+# ── Cron job endpoints ───────────────────────────────────────────────────────
+@app.route("/jobs/daily-summary", methods=["POST", "GET"])
+def trigger_daily_summary():
+    key = request.args.get('key', '')
+    if key != os.environ.get('CRON_SECRET', 'fitlogs-cron-2026'):
+        return jsonify({"error": "Unauthorized"}), 403
+    threading.Thread(target=send_daily_summaries, daemon=True).start()
+    return jsonify({"status": "started"}), 200
+
+@app.route("/jobs/weekly-digest", methods=["POST", "GET"])
+def trigger_weekly_digest():
+    key = request.args.get('key', '')
+    if key != os.environ.get('CRON_SECRET', 'fitlogs-cron-2026'):
+        return jsonify({"error": "Unauthorized"}), 403
+    threading.Thread(target=send_weekly_digests, daemon=True).start()
+    return jsonify({"status": "started"}), 200
+
+@app.route("/jobs/test-email", methods=["POST", "GET"])
+def test_email():
+    key = request.args.get('key', '')
+    if key != os.environ.get('CRON_SECRET', 'fitlogs-cron-2026'):
+        return jsonify({"error": "Unauthorized"}), 403
+    to = request.args.get('to', ZOHO_EMAIL)
+    ok = send_email(to, "FitLogs Email Test", "<h2>Email is working!</h2><p>Zoho SMTP configured correctly.</p>")
+    return jsonify({"status": "ok" if ok else "failed"}), 200
+
+# ── Health check ─────────────────────────────────────────────────────────────
+@app.route("/health")
 def health():
-    return jsonify({
-        "status": "ok",
-        "service": "fitlogs-webhook",
-        "version": "1.1-coach",
-        "number": FITLOGS_NUMBER,
-        "mms_enabled": False
-    })
+    return jsonify({"status": "ok", "service": "fitlogs-webhook"})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(debug=False, host="0.0.0.0", port=port)
