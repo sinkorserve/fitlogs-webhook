@@ -720,6 +720,142 @@ def test_email():
     return jsonify({"status": "ok" if ok else "failed"}), 200
 
 # ── Health check ─────────────────────────────────────────────────────────────
+
+# ── Photo Safety Check ──────────────────────────────────────────────────────
+def screen_image_for_safety(base64_img):
+    """
+    First-pass safety screen using Claude.
+    Returns (is_safe, reason) tuple.
+    """
+    try:
+        screen_msg = claude_client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=100,
+            system=(
+                "You are a content safety screener. "
+                "Your ONLY job is to determine if an image is safe for a family fitness app. "
+                "Respond ONLY with valid JSON: "
+                '{"safe": true/false, "reason": "brief reason if unsafe, empty string if safe"} '
+                "Mark as UNSAFE if the image contains: explicit sexual content, nudity beyond typical fitness/medical context, "
+                "graphic violence, illegal content, or anything inappropriate for a family health app. "
+                "A person in workout clothes, a plate of food, or a body in fitness context is SAFE."
+            ),
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": base64_img,
+                        },
+                    },
+                    {"type": "text", "text": "Is this image safe for a family fitness app?"}
+                ],
+            }]
+        )
+        import json as json_lib
+        raw = screen_msg.content[0].text.strip().replace("```json","").replace("```","").strip()
+        result = json_lib.loads(raw)
+        return result.get("safe", False), result.get("reason", "Content not appropriate")
+    except Exception as e:
+        app.logger.error(f"Safety screen error: {e}")
+        # Fail safe — reject if screening fails
+        return False, "Could not verify image safety"
+
+# ── Photo Analysis ───────────────────────────────────────────────────────────
+@app.route("/analyze-photo", methods=["POST", "OPTIONS"])
+def analyze_photo():
+    if request.method == "OPTIONS":
+        return '', 204
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+
+    photo_type  = data.get("type", "food")   # "food" or "body"
+    base64_img  = data.get("image", "")
+    goals       = data.get("goals", {})
+
+    if not base64_img:
+        return jsonify({"error": "No image provided"}), 400
+
+    try:
+        # ── SAFETY SCREEN FIRST — always runs before any analysis ──
+        is_safe, reason = screen_image_for_safety(base64_img)
+        if not is_safe:
+            app.logger.warning(f"Image rejected by safety screen: {reason}")
+            return jsonify({
+                "error": "inappropriate_content",
+                "message": "This image cannot be processed. Please upload a food photo or fitness-appropriate body photo."
+            }), 400
+
+        if photo_type == "food":
+            system_prompt = (
+                "You are a nutrition expert analyzing a food photo. "
+                "Identify all visible food items and estimate calories. "
+                "Be specific but concise. Never describe anything explicit or inappropriate. "
+                "If the image does not contain food, say so and return empty results. "
+                "Respond ONLY with valid JSON in this exact format: "
+                '{"items": [{"name": "food name", "quantity": "amount", "calories": 123}], '
+                '"total_calories": 456, "notes": "brief nutritional observation"}'
+            )
+        else:
+            target_weight = goals.get("target_weight", "not set")
+            target_waist  = goals.get("target_waist", "not set")
+            fitness_goal  = goals.get("fitness_goal", "general fitness")
+            system_prompt = (
+                "You are a professional fitness coach analyzing a body photo. "
+                "Provide constructive, encouraging observations about fitness level and body composition. "
+                "NEVER make negative or demeaning comments. "
+                "NEVER describe anything sexual or inappropriate — if the image is explicit, return an error. "
+                f"The user's goals: target weight {target_weight}, target waist {target_waist}, goal: {fitness_goal}. "
+                "Compare current appearance to typical progress toward these goals. "
+                "Respond ONLY with valid JSON: "
+                '{"observation": "professional fitness observation", '
+                '"progress_notes": "how this compares to stated goals", '
+                '"recommendations": ["tip 1", "tip 2", "tip 3"], '
+                '"appropriate": true}'
+            )
+
+        message = claude_client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=500,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": base64_img,
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": "Analyze this image and respond with JSON as instructed."
+                    }
+                ],
+            }]
+        )
+
+        import json as json_lib
+        raw = message.content[0].text.strip()
+        # Strip markdown code fences if present
+        raw = raw.replace("```json", "").replace("```", "").strip()
+        result = json_lib.loads(raw)
+
+        # Safety check for body photos
+        if photo_type == "body" and not result.get("appropriate", True):
+            return jsonify({"error": "Image not appropriate for analysis"}), 400
+
+        return jsonify({"status": "ok", "type": photo_type, "result": result}), 200
+
+    except Exception as e:
+        app.logger.error(f"analyze_photo error: {e}")
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/health")
 def health():
     return jsonify({"status": "ok", "service": "fitlogs-webhook"})
