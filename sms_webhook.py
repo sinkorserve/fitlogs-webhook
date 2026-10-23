@@ -127,12 +127,22 @@ def extract_numbers(text):
     nums = re.findall(r'\d+\.?\d*', text)
     return float(nums[0]) if nums else None
 
+def get_user_mode(phone):
+    """Return current routing mode for the user: 'sos' or 'fitness' (default)."""
+    try:
+        prefs = db.collection('users').document(phone).collection('settings').document('prefs').get()
+        if prefs.exists:
+            return prefs.to_dict().get('mode', 'fitness')
+    except Exception as e:
+        app.logger.error(f"get_user_mode error: {e}")
+    return 'fitness'
+
 def ai_coach_reply(body, log_type, phone):
     """Get a brief AI coach reply for the logged entry."""
     try:
-        # Get last 5 logs for context
+        # Get last 5 fitness logs for context
         recent = list(db.collection('users').document(phone)
-                        .collection('logs').order_by('timestamp', direction='DESCENDING')
+                        .collection('fitness').order_by('timestamp', direction='DESCENDING')
                         .limit(5).stream())
         ctx = '\n'.join([f"- {r.to_dict().get('body','')}" for r in recent])
 
@@ -292,7 +302,7 @@ def inbound_sms():
             today_str = datetime.now(timezone.utc).date().isoformat()
             logs = [
                 r.to_dict() for r in
-                db.collection('users').document(phone).collection('logs').stream()
+                db.collection('users').document(phone).collection('fitness').stream()
                 if (r.to_dict().get('timestampLocal') or '')[:10] == today_str
             ]
             if not logs:
@@ -332,35 +342,54 @@ def inbound_sms():
             resp.message("Your coach is unavailable right now. Try again in a moment.")
         return str(resp), 200, {"Content-Type": "text/xml"}
 
-    # ── Standard fitness log ──
+    # ── Standard log — route to fitness/ or sos/ based on user mode ──
     log_type = classify_log(body)
     value    = extract_numbers(body)
+    now_iso  = datetime.now(timezone.utc).isoformat()
+    mode     = get_user_mode(phone)
 
-    log_record = {
+    base_record = {
         "body":           body,
         "messageSid":     sid,
         "from":           phone,
         "timestamp":      firestore.SERVER_TIMESTAMP,
-        "timestampLocal": datetime.now(timezone.utc).isoformat(),
+        "timestampLocal": now_iso,
         "source":         "sms",
         "type":           log_type,
         "value":          value,
     }
 
     try:
-        email_key = find_email_key(phone)
-        db.collection('users').document(phone).collection('emails').document(email_key).collection('logs').document(sid).set(log_record)
-        db.collection('users').document(phone).collection('logs').document(sid).set(log_record)
-        app.logger.info(f"Saved log: users/{phone}/logs/{sid} type={log_type}")
+        user_ref = db.collection('users').document(phone)
+
+        # 1. Always write to texts/ — immutable audit trail of every inbound SMS
+        texts_record = {**base_record, "mode": mode}
+        user_ref.collection('texts').document(sid).set(texts_record)
+        app.logger.info(f"Saved to texts: users/{phone}/texts/{sid}")
+
+        # 2. Route to fitness/ or sos/ based on mode
+        if mode == 'sos':
+            user_ref.collection('sos').document(sid).set(base_record)
+            app.logger.info(f"Routed to sos: users/{phone}/sos/{sid}")
+        else:
+            user_ref.collection('fitness').document(sid).set(base_record)
+            # Also keep legacy emails subcollection path for existing dashboard reads
+            email_key = find_email_key(phone)
+            user_ref.collection('emails').document(email_key).collection('logs').document(sid).set(base_record)
+            app.logger.info(f"Routed to fitness: users/{phone}/fitness/{sid} type={log_type}")
+
     except Exception as e:
         app.logger.error(f"Firestore write failed: {e}")
 
-    # AI coach reply
-    coach_reply = ai_coach_reply(body, log_type, phone)
-    if coach_reply:
-        resp.message(coach_reply)
+    # AI coach reply (only for fitness mode — no coaching on SOS logs)
+    if mode == 'sos':
+        resp.message("🔒 Logged to your private journal.")
     else:
-        resp.message(f"✅ Logged to FitLogs ({log_type}). View your dashboard at fitlogs.ai")
+        coach_reply = ai_coach_reply(body, log_type, phone)
+        if coach_reply:
+            resp.message(coach_reply)
+        else:
+            resp.message(f"✅ Logged to FitLogs ({log_type}). View your dashboard at fitlogs.ai")
 
     return str(resp), 200, {"Content-Type": "text/xml"}
 
@@ -644,7 +673,7 @@ def send_daily_summaries():
             try:
                 todays = [
                     r.to_dict() for r in
-                    db.collection('users').document(phone).collection('logs').stream()
+                    db.collection('users').document(phone).collection('fitness').stream()
                     if (r.to_dict().get('timestampLocal') or '')[:10] == today_str
                 ]
                 if not todays:
@@ -675,7 +704,7 @@ def send_weekly_digests():
             try:
                 weeks = [
                     r.to_dict() for r in
-                    db.collection('users').document(phone).collection('logs').stream()
+                    db.collection('users').document(phone).collection('fitness').stream()
                     if week_start.isoformat() <= (r.to_dict().get('timestampLocal') or '')[:10] <= today.isoformat()
                 ]
                 if not weeks:
